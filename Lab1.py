@@ -1,43 +1,60 @@
-import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
 import numpy as np
-import itertools
-
-x = np.array(list(itertools.product([0, 1], repeat=4)), dtype=np.float32)
-
-
-def logic_func(name, x):
-    if name == "AND":
-        return np.all(x == 1, axis=1).astype(np.float32)
-    elif name == "OR":
-        return np.any(x == 1, axis=1).astype(np.float32)
-    elif name == "XOR":
-        return (np.sum(x, axis=1) % 2).astype(np.float32)
-    elif name == "NAND":
-        return (1 - np.all(x == 1, axis=1)).astype(np.float32)
-    elif name == "NOR":
-        return (1 - np.any(x == 1, axis=1)).astype(np.float32)
-    elif name == "XNOR":
-        return (1 - (np.sum(x, axis=1) % 2)).astype(np.float32)
-    else:
-        raise ValueError("Невідома функція. Використай: AND, OR, XOR, NAND, NOR, XNOR")
-
-func_name = input("Введіть логічну функцію (AND, OR, XOR, NAND, NOR, XNOR): ").strip().upper()
-y = logic_func(func_name, x)
-
-model = tf.keras.Sequential([
-    tf.keras.layers.Dense(8, input_dim=4, activation='tanh'),
-    tf.keras.layers.Dense(1, activation='sigmoid'),
+import pandas as pd
+import random
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+train = pd.read_csv("/kaggle/input/digit-recognizer/train.csv")
+test = pd.read_csv("/kaggle/input/digit-recognizer/test.csv")
+x_train = train.iloc[:, 1:].values.astype("float32") / 255.0
+y_train = train.iloc[:, 0].values
+x_train, x_test, y_train, y_test = train_test_split(
+    x_train, y_train, test_size=0.2, random_state=42
+)
+y_train_cat = keras.utils.to_categorical(y_train, 10)
+y_test_cat = keras.utils.to_categorical(y_test, 10)
+model = keras.Sequential([
+    layers.Input(shape=(784,)),
+    layers.Dense(128, activation="relu"),
+    layers.Dense(64, activation="relu"),
+    layers.Dense(10, activation="softmax")
 ])
-model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.05),
-              loss='binary_crossentropy',
-              metrics=['accuracy'])
+model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+history = model.fit(
+    x_train, y_train_cat,
+    epochs=10,
+    batch_size=32,
+    validation_data=(x_test, y_test_cat),
+    verbose=1
+)
+plt.plot(history.history["accuracy"], label="Точність на train")
+plt.plot(history.history["val_accuracy"], label="Точність на test")
+plt.xlabel("Епоха")
+plt.ylabel("Точність")
+plt.legend()
+plt.show()
 
-model.fit(x, y, epochs=300, verbose=0)
-
-loss, acc = model.evaluate(x, y, verbose=0)
-print(f"\nФункція: {func_name}")
-print("loss:", loss, "accuracy:", acc)
-
-pred = model.predict(x)
-for inp, p, expected in zip(x, pred, y):
-    print(inp.astype(int), "->", round(p[0]), f"({p[0]:.4f})", "expect", int(expected))
+loss, accuracy = model.evaluate(x_test, y_test_cat)
+print(f"Точність на тестових даних: {accuracy * 100:.2f}%")
+y_pred = model.predict(x_test)
+y_pred_classes = np.argmax(y_pred, axis=1)
+cm = confusion_matrix(y_test, y_pred_classes)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+plt.xlabel("Передбачені мітки")
+plt.ylabel("Справжні мітки")
+plt.title("Матриця помилок")
+plt.show()
+def show_predictions(images, labels, preds, n=5):
+    idxs = random.sample(range(len(images)), n)
+    plt.figure(figsize=(10, 5))
+    for i, idx in enumerate(idxs):
+        plt.subplot(1, n, i + 1)
+        plt.imshow(images[idx].reshape(28, 28), cmap="gray")
+        plt.title(f"Передбачено: {preds[idx]}\nПравильно: {labels[idx]}")
+        plt.axis("off")
+    plt.show()
+show_predictions(x_test, y_test, y_pred_classes, n=5)
