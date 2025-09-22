@@ -1,0 +1,10 @@
+{
+  "class_names": [
+    "BMW",
+    "Mercedes"
+  ],
+  "class_indices": {
+    "BMW": 0,
+    "Mercedes": 1
+  }
+}
