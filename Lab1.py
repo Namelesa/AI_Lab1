@@ -1,189 +1,170 @@
 import os
-import json
-import numpy as np
 import tensorflow as tf
-from tensorflow.keras import layers, models, optimizers, callbacks
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, accuracy_score, roc_curve
-import matplotlib.pyplot as plt
-from collections import Counter
-IMG_SIZE = (299, 299)
+from tensorflow.keras import layers, Model
+
+TRAIN_ROOT = "/kaggle/input/cars-for-lab"
+VAL_DIRS = {
+    "BMW": "/kaggle/input/cars-for-lab/BMW",
+    "Mercedes": "/kaggle/input/cars-for-lab/Mercedes"
+}
+
+IMG_SIZE = (224, 224)
 BATCH_SIZE = 16
-EPOCHS = 20
-LEARNING_RATE = 1e-4
-DATASET_DIR = "dataset"
-MODEL_NAME = "inception_transfer.h5"
-CLASS_INDICES_PATH = "class_indices.json"
-METADATA_PATH = "model_metadata.json"
-def create_data_generators():
-    train_datagen = ImageDataGenerator(
-        rescale=1. / 255,
-        rotation_range=30,
-        width_shift_range=0.15,
-        height_shift_range=0.15,
-        shear_range=0.15,
-        zoom_range=0.15,
-        horizontal_flip=True,
-        vertical_flip=False,
-        validation_split=0.2,
-        fill_mode='nearest'
+EPOCHS = 15
+
+def list_images(d):
+    good_ext = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif")
+    files = [
+        os.path.join(d, f)
+        for f in os.listdir(d)
+        if f.lower().endswith(good_ext) and os.path.isfile(os.path.join(d, f))
+    ]
+    valid_files = []
+    for f in files:
+        try:
+            with open(f, 'rb') as img_file:
+                header = img_file.read(12)
+                if (header[:2] == b'\xff\xd8' or
+                    header[:8] == b'\x89PNG\r\n\x1a\n' or
+                    header[:6] in (b'GIF87a', b'GIF89a') or
+                    header[:2] == b'BM'):
+                    valid_files.append(f)
+        except:
+            pass
+    return valid_files
+
+all_classes = [d for d in os.listdir(TRAIN_ROOT) if os.path.isdir(os.path.join(TRAIN_ROOT, d))]
+classes = sorted(all_classes)
+class_index = {c: i for i, c in enumerate(classes)}
+
+print(f"Знайдені класи: {classes}\n")
+
+train_files = []
+train_labels = []
+
+for cls in classes:
+    cls_dir = os.path.join(TRAIN_ROOT, cls)
+    if not os.path.isdir(cls_dir):
+        continue
+    idx = class_index[cls]
+    images = list_images(cls_dir)
+    for p in images:
+        train_files.append(p)
+        train_labels.append(idx)
+    print(f"Клас {cls}: додано {len(images)} файлів для навчання")
+
+val_files = []
+val_labels = []
+
+for cls, cls_dir in VAL_DIRS.items():
+    if not os.path.isdir(cls_dir):
+        print(f"УВАГА: Директорія {cls_dir} не знайдена!")
+        continue
+    idx = class_index[cls]
+    images = list_images(cls_dir)
+    for p in images:
+        val_files.append(p)
+        val_labels.append(idx)
+    print(f"Клас {cls}: додано {len(images)} файлів для валідації")
+
+print(f"\n✅ Всього для навчання: {len(train_files)} файлів")
+print(f"✅ Всього для валідації: {len(val_files)} файлів")
+
+def make_dataset(file_paths, labels, shuffle=True, augment=False):
+    ds = tf.data.Dataset.from_tensor_slices((file_paths, labels))
+    def _load(path, label):
+        img = tf.io.read_file(path)
+        img = tf.image.decode_image(img, channels=3, expand_animations=False)
+        img.set_shape([None, None, 3])
+        img = tf.image.resize(img, IMG_SIZE)
+        if augment:
+            img = tf.image.random_flip_left_right(img)
+            img = tf.image.random_brightness(img, 0.2)
+            img = tf.image.random_contrast(img, 0.8, 1.2)
+            img = tf.image.random_saturation(img, 0.8, 1.2)
+        img = img / 255.0
+        return img, label
+    ds = ds.map(lambda p, l: _load(p, l), num_parallel_calls=tf.data.AUTOTUNE)
+    if shuffle:
+        ds = ds.shuffle(1000)
+    ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    return ds
+
+train_ds = make_dataset(train_files, train_labels, shuffle=True, augment=True)
+val_ds = make_dataset(val_files, val_labels, shuffle=False, augment=False)
+
+input_tensor = layers.Input(shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+base_model = tf.keras.applications.InceptionV3(
+    include_top=False, weights="imagenet", input_tensor=input_tensor
+)
+
+x = base_model.output
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.5)(x)
+x = layers.Dense(128, activation="relu")(x)
+x = layers.BatchNormalization()(x)
+x = layers.Dropout(0.3)(x)
+output = layers.Dense(len(classes), activation="softmax")(x)
+
+model = Model(inputs=base_model.input, outputs=output)
+for layer in base_model.layers:
+    layer.trainable = False
+
+initial_learning_rate = 0.001
+lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+    initial_learning_rate, decay_steps=100, decay_rate=0.96, staircase=True
+)
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=lr_schedule),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+callbacks = [
+    tf.keras.callbacks.EarlyStopping(
+        monitor='val_accuracy',
+        patience=5,
+        restore_best_weights=True
+    ),
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=3,
+        min_lr=1e-7
     )
-    train_generator = train_datagen.flow_from_directory(
-        DATASET_DIR,
-        target_size=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        class_mode='binary',
-        subset='training',
-        shuffle=True
-    )
-    val_generator = train_datagen.flow_from_directory(
-        DATASET_DIR,
-        target_size=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        class_mode='binary',
-        subset='validation',
-        shuffle=False
-    )
-    for class_name, class_index in train_generator.class_indices.items():
-        print(f"   {class_name} -> індекс {class_index}")
-    return train_generator, val_generator
-def create_callbacks():
-    early = callbacks.EarlyStopping(monitor='val_loss', patience=6, restore_best_weights=True)
-    reduce = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=3, min_lr=1e-7)
-    checkpoint = callbacks.ModelCheckpoint(MODEL_NAME, monitor='val_loss', save_best_only=True)
-    return [early, reduce, checkpoint]
-def build_inception_v3_transfer(input_shape=(299, 299, 3), num_classes=1, freeze_base=True):
-    base_model = tf.keras.applications.InceptionV3(weights='imagenet', include_top=False, input_shape=input_shape)
-    if freeze_base:
-        base_model.trainable = False
-    inputs = layers.Input(shape=input_shape)
-    x = base_model(inputs, training=False)
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dropout(0.4)(x)
-    x = layers.Dense(512, activation='relu')(x)
-    x = layers.Dropout(0.3)(x)
-    outputs = layers.Dense(num_classes, activation='sigmoid')(x)
-    model = models.Model(inputs, outputs, name="InceptionV3_transfer")
-    return model, base_model
-def find_best_threshold(y_true, y_prob):
-    fpr, tpr, thresholds = roc_curve(y_true, y_prob)
-    j_scores = tpr - fpr
-    ix = np.argmax(j_scores)
-    return float(thresholds[ix])
-def train_model():
-    train_generator, val_generator = create_data_generators()
-    class_indices = train_generator.class_indices
-    class_names = [""] * len(class_indices)
-    for class_name, index in class_indices.items():
-        class_names[index] = class_name
-    with open(CLASS_INDICES_PATH, "w", encoding="utf-8") as f:
-        json.dump({"class_names": class_names, "class_indices": class_indices}, f, ensure_ascii=False, indent=2)
-    model, base_model = build_inception_v3_transfer(input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3), freeze_base=True)
-    model.compile(
-        optimizer=optimizers.Adam(learning_rate=LEARNING_RATE),
-        loss="binary_crossentropy",
-        metrics=["accuracy", tf.keras.metrics.Precision(name='precision'), tf.keras.metrics.Recall(name='recall'),
-                 tf.keras.metrics.AUC(name='auc')]
-    )
-    callbacks_list = create_callbacks()
-    counter = Counter(train_generator.classes)
-    majority = max(counter.values())
-    class_weight = {cls: float(majority / count) for cls, count in counter.items()}
-    history = model.fit(
-        train_generator,
-        validation_data=val_generator,
-        epochs=EPOCHS,
-        callbacks=callbacks_list,
-        class_weight=class_weight,
-        verbose=1
-    )
-    val_generator.reset()
-    y_prob = model.predict(val_generator, verbose=1).ravel()
-    y_true = val_generator.classes
-    best_thresh = find_best_threshold(y_true, y_prob)
-    model.save(MODEL_NAME)
-    with open(METADATA_PATH, "w", encoding="utf-8") as f:
-        json.dump({"threshold": best_thresh}, f, ensure_ascii=False, indent=2)
-    base_model.trainable = True
-    for layer in base_model.layers[:-50]:
-        layer.trainable = False
-    model.compile(
-        optimizer=optimizers.Adam(learning_rate=LEARNING_RATE / 10),
-        loss="binary_crossentropy",
-        metrics=["accuracy", tf.keras.metrics.Precision(name='precision'), tf.keras.metrics.Recall(name='recall'),
-                 tf.keras.metrics.AUC(name='auc')]
-    )
-    ft_history = model.fit(
-        train_generator,
-        validation_data=val_generator,
-        epochs=max(5, EPOCHS // 2),
-        callbacks=callbacks_list,
-        class_weight=class_weight,
-        verbose=1
-    )
-    model.save(MODEL_NAME)
-    return model, val_generator, class_names
-def evaluate_model(model, val_generator, class_names):
-    val_generator.reset()
-    y_prob = model.predict(val_generator, verbose=1)
-    y_prob = y_prob.ravel()
-    if os.path.exists(METADATA_PATH):
-        with open(METADATA_PATH, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-            threshold = float(meta.get("threshold", 0.5))
-    else:
-        threshold = 0.5
-    y_pred = (y_prob > threshold).astype(int)
-    y_true = val_generator.classes
-    y_pred_names = [class_names[pred] for pred in y_pred]
-    y_true_names = [class_names[true] for true in y_true]
-    acc = accuracy_score(y_true_names, y_pred_names)
-    prec = precision_score(y_true_names, y_pred_names, labels=class_names, average="weighted", zero_division=0)
-    rec = recall_score(y_true_names, y_pred_names, labels=class_names, average="weighted", zero_division=0)
-    f1 = f1_score(y_true_names, y_pred_names, labels=class_names, average="weighted", zero_division=0)
-    cm = confusion_matrix(y_true_names, y_pred_names, labels=class_names)
-    plt.figure(figsize=(6, 6))
-    plt.imshow(cm, interpolation='nearest')
-    plt.title('Матриця невідповідностей')
-    plt.colorbar()
-    tick_marks = np.arange(len(class_names))
-    plt.xticks(tick_marks, class_names, rotation=45)
-    plt.yticks(tick_marks, class_names)
-    plt.ylabel('Істинні')
-    plt.xlabel('Прогнозовані')
-    plt.tight_layout()
-    plt.savefig("confusion_matrix.png")
-    return {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "cm": cm, "threshold": threshold}
-def predict_image(model, image_path, class_names):
-    img = tf.keras.preprocessing.image.load_img(image_path, target_size=IMG_SIZE)
-    arr = tf.keras.preprocessing.image.img_to_array(img)
-    arr = arr / 255.0
-    arr = np.expand_dims(arr, axis=0)
-    prob = model.predict(arr, verbose=0).ravel()[0]
-    if os.path.exists(METADATA_PATH):
-        with open(METADATA_PATH, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-            threshold = float(meta.get("threshold", 0.5))
-    else:
-        threshold = 0.5
-    if prob > threshold:
-        predicted = class_names[1]
-        confidence = prob * 100
-    else:
-        predicted = class_names[0]
-        confidence = (1 - prob) * 100
-    return predicted, confidence
-if __name__ == "__main__":
-    if not os.path.exists(DATASET_DIR):
-        print("❌ Папка з даними не знайдена:", DATASET_DIR)
-    else:
-        model, val_gen, class_names = train_model()
-        results = evaluate_model(model, val_gen, class_names)
-        test_dir = "dataset"
-        if os.path.exists(test_dir):
-            for fname in os.listdir(test_dir):
-                if fname.lower().endswith((".jpg", ".jpeg", ".png")):
-                    path = os.path.join(test_dir, fname)
-                    predict_image(model, path, class_names)
-        else:
-            print("ℹ️ Папка test_images не знайдена. Додайте туди зображення для перевірки.")
+]
+
+print("\n🚀 Починаємо навчання...\n")
+
+history = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=EPOCHS,
+    callbacks=callbacks
+)
+
+print("\n🔧 Fine-tuning: розморожуємо останні шари...\n")
+base_model.trainable = True
+for layer in base_model.layers[:-30]:
+    layer.trainable = False
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+history_fine = model.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=10,
+    callbacks=callbacks
+)
+
+model.save("/kaggle/working/inception_custom.h5")
+print("\n✅ Модель збережена!")
+
+print(f"\nФінальна точність на навчанні: {history_fine.history['accuracy'][-1]:.4f}")
+print(f"Фінальна точність на валідації: {history_fine.history['val_accuracy'][-1]:.4f}")
